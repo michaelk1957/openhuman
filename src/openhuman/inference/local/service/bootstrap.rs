@@ -63,6 +63,19 @@ impl LocalAiService {
                 // reqwest's per-request `.timeout()` still bounds the rest of
                 // the exchange.
                 .connect_timeout(std::time::Duration::from_millis(500))
+                // Do not reuse idle keep-alive connections. Remote LM Studio /
+                // vLLM servers run behind uvicorn, whose default keep-alive
+                // timeout is ~5s. With connection pooling on, this client would
+                // warm a connection (e.g. the bootstrap GET /models) and then,
+                // a few seconds later, reuse it for the chat POST — but the
+                // server may have already closed that idle connection. Reusing
+                // it loses the race and reqwest does NOT retry the (non-
+                // idempotent) POST, surfacing as
+                // "error sending request for url (.../chat/completions)".
+                // Dialing a fresh connection per request avoids the stale-reuse
+                // race entirely. The cost is one extra TCP/connect per call,
+                // which is negligible for these low-QPS inference calls.
+                .pool_max_idle_per_host(0)
                 .build()
                 .unwrap_or_else(|e| {
                     log::warn!("[local_ai] reqwest client build failed, falling back to default client: {e}");
