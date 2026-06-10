@@ -138,6 +138,24 @@ fn collect_hits_and_nodes(
                         );
                     }
                 }
+                // #1574: embeddings live in the per-model sidecar
+                // (`mem_tree_summary_embeddings`); the legacy in-row
+                // `mem_tree_summaries.embedding` column is left NULL by the
+                // write path. `rerank_by_semantic_similarity` reads
+                // `node.embedding`, so without this every summary looks
+                // un-embedded and recall silently degrades to recency order.
+                // Hydrate from the sidecar (active signature); only when the
+                // legacy column gave us nothing, so pre-#1574 rows still work.
+                if node.embedding.is_none() {
+                    match store::get_summary_embedding(config, &node.id) {
+                        Ok(Some(v)) => node.embedding = Some(v),
+                        Ok(None) => {}
+                        Err(e) => log::warn!(
+                            "[retrieval::source] sidecar embedding read failed for {}: {e:#}",
+                            node.id
+                        ),
+                    }
+                }
                 hits.push(hit_from_summary(&node, &tree.scope));
                 nodes.push((node, tree.scope.clone()));
             }
