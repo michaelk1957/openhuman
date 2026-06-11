@@ -22,6 +22,9 @@ use crate::openhuman::memory_queue::types::{
     TopicRoutePayload,
 };
 use crate::openhuman::memory_store::chunks::store as chunk_store;
+use crate::openhuman::memory_store::chunks::types::{
+    conservative_token_estimate, truncate_to_conservative_tokens,
+};
 use crate::openhuman::memory_store::content::{
     self as content_store, read as content_read, tags as content_tags,
 };
@@ -34,6 +37,38 @@ use crate::openhuman::memory_tree::tree::{LeafRef, TreeFactory};
 /// Default age for L0 flush_stale when the caller doesn't override.
 /// 1 hour means low-volume sources get summaries within a working session.
 const L0_DEFAULT_FLUSH_AGE_SECS: i64 = 60 * 60;
+
+/// Conservative per-request embed token budget. Kept under the embedder's batch
+/// limit (`EMBED_NUM_CTX` = 8192) with margin, measured with the conservative
+/// estimator (which over-counts dense/multilingual text). Truncating a body to
+/// this before `.embed()` guarantees no request can exceed the embedder context
+/// and terminally fail an embed job (which previously tombstoned chunks and
+/// flipped `pipeline_status` to error). The chunker keeps normal chunks well
+/// under this; the cap is the last-resort backstop for any body that reaches an
+/// embed call without going through the chunker.
+const EMBED_SAFE_TOKENS: u32 = 7500;
+
+/// Embed `text`, defensively truncating to [`EMBED_SAFE_TOKENS`] first so a body
+/// that slipped past the chunker can never overflow the embedder. Logs (without
+/// content) when truncation actually happens.
+async fn embed_capped(
+    embedder: &dyn crate::openhuman::memory_tree::score::embed::Embedder,
+    text: &str,
+    what: &str,
+) -> Result<Vec<f32>> {
+    let safe = truncate_to_conservative_tokens(text, EMBED_SAFE_TOKENS);
+    if safe.len() < text.len() {
+        log::warn!(
+            "[memory::jobs] {what}: body {}B (~{} est-tokens) exceeds embed budget {}; \
+             embedding first {}B to stay within the embedder context",
+            text.len(),
+            conservative_token_estimate(text),
+            EMBED_SAFE_TOKENS,
+            safe.len()
+        );
+    }
+    embedder.embed(safe).await
+}
 
 /// Dispatch a claimed job to the matching per-kind handler.
 ///
@@ -82,11 +117,15 @@ async fn handle_extract(config: &Config, job: &Job) -> Result<JobOutcome> {
     let chunk_embedding: Option<Vec<f32>> = if result.kept {
         let embedder =
             build_embedder_from_config(config).context("build embedder in extract handler")?;
-        // Reuse the body already read — avoid a second disk read.
-        let vector = embedder
-            .embed(&body)
-            .await
-            .with_context(|| format!("embed chunk_id={} in extract handler", chunk.id))?;
+        // Reuse the body already read — avoid a second disk read. Capped so an
+        // oversized body can never overflow the embedder and terminally fail.
+        let vector = embed_capped(
+            embedder.as_ref(),
+            &body,
+            &format!("extract chunk_id={}", chunk.id),
+        )
+        .await
+        .with_context(|| format!("embed chunk_id={} in extract handler", chunk.id))?;
         // Preserve the pre-cutover dimension guard (the job fails fast on a
         // misconfigured embedder) even though #1574 no longer persists the
         // packed blob to the legacy `mem_tree_chunks.embedding` column —
@@ -678,7 +717,7 @@ async fn handle_reembed_backfill(config: &Config, job: &Job) -> Result<JobOutcom
     let mut chunk_vecs: Vec<(String, Vec<f32>)> = Vec::new();
     for id in &chunk_ids {
         match content_read::read_chunk_body(config, id) {
-            Ok(body) => match embedder.embed(&body).await {
+            Ok(body) => match embed_capped(embedder.as_ref(), &body, "reembed chunk").await {
                 Ok(v) if pack_checked(&v).is_ok() => chunk_vecs.push((id.clone(), v)),
                 Ok(_) => {
                     log::warn!(
@@ -714,7 +753,7 @@ async fn handle_reembed_backfill(config: &Config, job: &Job) -> Result<JobOutcom
     let mut summary_vecs: Vec<(String, Vec<f32>)> = Vec::new();
     for id in &summary_ids {
         match content_read::read_summary_body(config, id) {
-            Ok(body) => match embedder.embed(&body).await {
+            Ok(body) => match embed_capped(embedder.as_ref(), &body, "reembed summary").await {
                 Ok(v) if pack_checked(&v).is_ok() => summary_vecs.push((id.clone(), v)),
                 Ok(_) => {
                     log::warn!(
@@ -1507,5 +1546,50 @@ mod tests {
             1,
             "re-call must dedupe to a single chain per signature"
         );
+    }
+
+    /// `embed_capped` must truncate an over-budget body to `EMBED_SAFE_TOKENS`
+    /// before calling the embedder, and pass small bodies through verbatim, so
+    /// no request can exceed the embedder's input limit.
+    #[tokio::test]
+    async fn embed_capped_truncates_oversized_body() {
+        use crate::openhuman::memory_tree::score::embed::{Embedder, EMBEDDING_DIM};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Test embedder that records the byte length of the text it received.
+        struct LenRecorder(Arc<AtomicUsize>);
+        #[async_trait]
+        impl Embedder for LenRecorder {
+            fn name(&self) -> &'static str {
+                "len-recorder"
+            }
+            async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                self.0.store(text.len(), Ordering::SeqCst);
+                Ok(vec![0.0; EMBEDDING_DIM])
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let emb = LenRecorder(seen.clone());
+
+        // Punctuation-dense body (~1 token/char) far over the embed budget.
+        let big = "x,".repeat(EMBED_SAFE_TOKENS as usize);
+        assert!(conservative_token_estimate(&big) > EMBED_SAFE_TOKENS);
+        let out = embed_capped(&emb, &big, "test").await.unwrap();
+        assert_eq!(out.len(), EMBEDDING_DIM);
+
+        let sent = seen.load(Ordering::SeqCst);
+        assert!(sent < big.len(), "oversized body must be truncated");
+        assert!(
+            conservative_token_estimate(&big[..sent]) <= EMBED_SAFE_TOKENS,
+            "truncated body must be within the embed budget",
+        );
+
+        // A small body is passed through unchanged.
+        let small = "hello world";
+        embed_capped(&emb, small, "test").await.unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), small.len());
     }
 }
